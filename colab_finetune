@@ -1,0 +1,500 @@
+import torch
+from transformers import AutoModelForCausalLM,AutoTokenizer, Trainer, TrainingArguments
+from peft import get_peft_model, LoraConfig
+from bitsandbytes.optim import Adam8bit , AdamW
+from datasets import Dataset
+import pandas as pd
+
+
+# Define the model path
+model_name = "ytu-ce-cosmos/Turkish-Llama-8b-Instruct-v0.1"
+
+# Load the tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+# Check if pad_token is None
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token  # Use EOS token as padding, or define another special token
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+
+# Apply LoRA to the model
+lora_config = LoraConfig(
+    r=8,  # Rank of the adaptation matrices
+    lora_alpha=32,  # Scaling factor for LoRA
+    lora_dropout=0.1,  # Dropout probability for LoRA layers
+    bias="none",  # Bias term handling in LoRA layers
+    task_type="CAUSAL_LM"  # Suitable task type for an autoregressive model
+)
+
+# Create the LoRA model by passing the base model and LoRA configuration
+lora_model = get_peft_model(base_model, lora_config)
+#lora_model.eval()  # Put the model in evaluation mode
+
+lora_model.print_trainable_parameters()
+
+
+# 8-bit optimizer (Adam8bit from bitsandbytes)
+#optimizer = Adam8bit(lora_model.parameters(), lr=1e-4)
+optimizer = AdamW(lora_model.parameters(), lr=1e-4)
+
+
+from datasets import Dataset
+import pandas as pd
+
+
+
+# Define a variable to choose which prompt file to load
+prompt_choice = 1  # Set to 1, 2, 3, or 4 depending on which prompt you want to use
+prompt_choice = 3  # Set to 1, 2, 3, or 4 depending on which prompt you want to use
+prompt_choice = 2  # Set to 1, 2, 3, or 4 depending on which prompt you want to use
+prompt_choice = 4  # Set to 1, 2, 3, or 4 depending on which prompt you want to use
+
+
+# Prompt choices handling
+if prompt_choice == 1:
+    #output_prompt = pd.read_excel('final_output_prompt1.csv')
+    output_prompt = pd.read_csv('gemini_output_prompt1_son_training.csv')
+    prompt = "Yukarıdaki dokümandaki gereksiz kısımları sil ve düzenli bir üniversite ders notu formatında tekrar yaz."
+
+elif prompt_choice == 2:
+    output_prompt = pd.read_csv('gemini_output_prompt2_son_training.csv')
+    prompt = "Yukarıdaki metni, bir gazete makalesi formatında yaz. Yazıyı, haber formatına uygun olarak başlık, alt başlık ve paragraflara ayır. Okuyucuyu bilgilendiren ve dikkatini çeken bir dil kullan, haberin özünü hızlıca açıklayan bir girişle başla ve ardından konuya dair derinlemesine bilgi ver. Makale sonunda konuyla ilgili önemli sonuçlar veya öneriler sun."
+
+elif prompt_choice == 3:
+    output_prompt = pd.read_csv('gemini_output_prompt3_son_training.csv')
+    prompt = "Yukarıdaki dokümanı, bir romanın anlatım tarzında yeniden yazın. Olayları daha akıcı bir şekilde anlatın, duygusal bir ton katın ve karakterlerin bakış açısından anlatmaya çalışın."
+
+elif prompt_choice == 4:
+    output_prompt = pd.read_csv('gemini_output_prompt4_son_training.csv')
+    prompt = "Yukarıdaki metni, bir blog yazısı formatında, geniş bir okuyucu kitlesine hitap edecek şekilde düzenle. Dilini samimi, akıcı ve anlaşılır tut, aynı zamanda konuyu merak uyandırıcı ve ilgi çekici bir şekilde sun. Paragrafları kısa tutarak okunabilirliği artır, başlıklar ve alt başlıklar ekleyerek yazının yapısını belirginleştir. Örnekler ve anekdotlar ile konuyu daha kişisel ve günlük yaşamla ilişkilendirerek okuyucunun dikkatini çek."
+
+else:
+    raise ValueError("Invalid prompt_choice value. It should be 1, 2, 3, or 4.")
+
+
+
+output_prompt = output_prompt.iloc[:, :3]
+
+
+# Ensure that the output contains the correct columns: 'id', 'text', 'gemini_output'
+output_prompt.columns = ['id', 'text', 'gemini_output']
+# Assuming that the 'text' column is the one to which the prompt will be appended
+output_prompt["text"] = output_prompt["text"] + " " + prompt
+
+output_prompt["text"] = output_prompt["text"].apply(lambda x: x.replace("|n", "\n"))
+
+
+# Check the output of the updated 'output_prompt'
+print(output_prompt.head())  # This will print the first 5 rows of the DataFrame
+
+# Convert to Hugging Face Dataset
+dataset = Dataset.from_pandas(output_prompt)
+
+# Print the first 5 rows of the 'text' column from the Hugging Face Dataset
+print(dataset["text"][1:2])
+
+def preprocess_function(examples):
+    texts = examples["text"]
+    outputs = examples["gemini_output"]
+
+    # Concatenate text and output
+    concatenated_texts = [
+        "<|start_header_id|>user<|end_header_id|>" + (text) +
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>" + (output) +
+        "<|eot_id|>"
+        for text, output in zip(texts, outputs)
+    ]
+
+    # Tokenize the concatenated texts
+    model_inputs = tokenizer(
+        concatenated_texts,
+        #truncation=True,
+        padding="max_length",  # Optional: you can remove this if you want variable length
+        max_length=2048,  # Adjust this based on your model's token length limit
+        add_special_tokens=True
+    )
+
+    # Create labels by shifting the input sequence
+    labels = model_inputs["input_ids"].copy()  # Start with the same token IDs
+    model_inputs["labels"] = labels
+
+    return model_inputs
+
+# Preprocess the dataset (without filtering yet)
+tokenized_dataset = dataset.map(preprocess_function, batched=True)
+
+# Now filter rows with more than 2048 tokens
+def filter_function(example):
+    return len(example['input_ids']) <= 2048
+
+filtered_dataset = tokenized_dataset.filter(filter_function)
+
+
+
+print(filtered_dataset)
+
+print(filtered_dataset[0]["text"])
+
+
+print(filtered_dataset[0]["gemini_output"])
+
+
+
+
+# Split into training and evaluation datasets
+train_test_split = filtered_dataset.train_test_split(test_size=0.2)
+train_dataset = train_test_split["train"]
+eval_dataset = train_test_split["test"]
+
+# Verify the splits
+print(f"Train dataset size: {len(train_dataset)}")
+print(f"Eval dataset size: {len(eval_dataset)}")
+
+
+
+
+training_args = TrainingArguments(
+    per_device_train_batch_size=1,    # Set the batch size to 1
+    per_device_eval_batch_size=1,    # Set the batch size to 1
+    gradient_accumulation_steps=8,   # Accumulate gradients for 8 steps
+
+
+    num_train_epochs=3,               # Set the number of epochs
+    evaluation_strategy="steps",      # Evaluate every `eval_steps` steps
+
+    eval_steps=250,
+    output_dir="./results",           # Set the output directory
+    logging_dir='./logs',             # Logging directory for TensorBoard
+    logging_steps=250,                 # Log training loss every _ steps
+    save_steps=250,                    # Save the model every _ steps (a multiple of eval_steps)
+    logging_first_step=True,          # Log the first step as well
+
+
+    load_best_model_at_end=True,      # Load the best model based on validation metrics (optional)
+    metric_for_best_model="eval_loss",  # Choose the metric to track the best model
+    greater_is_better=False,  # Loss should decrease, so False is appropriate
+
+    weight_decay=0.01,
+    warmup_ratio=0.1,
+    max_grad_norm=2.0                    # Gradient clipping
+
+
+)
+
+
+
+# Initialize the Trainer with the compute_metrics function
+trainer = Trainer(
+    model=lora_model,  # Model with LoRA applied
+    args=training_args,
+    train_dataset=train_dataset,  # Training dataset
+    eval_dataset=eval_dataset,  # Evaluation dataset
+    tokenizer=tokenizer,  # Tokenizer
+    optimizers=(optimizer, None),  # Optimizer
+)
+
+# Train the model
+trainer.train()
+
+
+model_save_path = f"./fine_tuned_model_prompt{prompt_choice}"
+# Save the fine-tuned model
+trainer.save_model(model_save_path)
+
+# Optionally, evaluate the model
+eval_results = trainer.evaluate()
+print("Evaluation results:", eval_results)
+
+
+
+# # Extract the LoRA parameters from the LoRA model
+# lora_state_dict = lora_model.state_dict()
+# lora_save_path = f"./lora_adapter_prompt{prompt_choice}.pth"
+# # Save the LoRA parameters into a file
+# torch.save(lora_state_dict, lora_save_path)  # Save LoRA parameters with dynamic name based on prompt_choice
+
+# print(f"LoRA parameters saved in: ./lora_adapter_prompt{prompt_choice}.pth")
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_path =  f"./fine_tuned_model_prompt{1}"
+model_path =  f"./results/checkpoint-500"
+model_path =  f"./fine_tuned_model_prompt{3}"
+model_path =  f"./fine_tuned_model_prompt{2}"
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    device_map="auto",  # Automatically distribute model across available devices (GPU/CPU)
+    torch_dtype=torch.bfloat16,  # Use float16 for better memory efficiency (if using GPU)
+)
+
+# Step 4: Set both models to evaluation mode
+#model.eval()
+
+
+# Move model to the correct device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model.to(device)
+
+# Load the tokenizer
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+# Set pad_token to eos_token for compatibility
+tokenizer.pad_token = tokenizer.eos_token
+model.config.pad_token_id = tokenizer.eos_token_id
+
+# Define the input text
+input_text = "Once upon a time, there was a little girl who loved reading books."
+
+
+inputs_message = [
+    {"role": "system", "content": "User'ın verdiği görevi yerine getir.Sadece assistant olarak cevap ver.Asla system veya user kullanma."},
+    {"role": "user", "content": input_text}
+    ]
+
+
+
+
+
+'''
+# Tokenize the input text
+inputs = tokenizer.apply_chat_template(
+    inputs_message,
+    return_tensors="pt",
+
+    add_generation_prompt=True,
+
+).to(model.device)
+
+
+outputs = model.generate(
+    inputs,
+    do_sample=True,
+    temperature=0.6,
+    top_p=0.9,
+
+    num_return_sequences=1,
+    no_repeat_ngram_size=2,  # Avoid repeated phrases
+
+
+)
+
+# Decode and print the output
+print(tokenizer.decode(outputs[0]))
+'''
+
+import csv
+from collections import defaultdict
+
+# Define the prompts
+prompt1 = "Yukarıdaki metni, bir gazete makalesi formatında yaz. Yazıyı, haber formatına uygun olarak başlık, alt başlık ve paragraflara ayır. Okuyucuyu bilgilendiren ve dikkatini çeken bir dil kullan, haberin özünü hızlıca açıklayan bir girişle başla ve ardından konuya dair derinlemesine bilgi ver. Makale sonunda konuyla ilgili önemli sonuçlar veya öneriler sun."
+prompt2 = "Yukarıdaki metni, bir gazete makalesi formatında yaz. Yazıyı, haber formatına uygun olarak başlık, alt başlık ve paragraflara ayır. Okuyucuyu bilgilendiren ve dikkatini çeken bir dil kullan, haberin özünü hızlıca açıklayan bir girişle başla ve ardından konuya dair derinlemesine bilgi ver. Makale sonunda konuyla ilgili önemli sonuçlar veya öneriler sun."
+prompt3 = "Yukarıdaki metni, bir gazete makalesi formatında yaz. Yazıyı, haber formatına uygun olarak başlık, alt başlık ve paragraflara ayır. Okuyucuyu bilgilendiren ve dikkatini çeken bir dil kullan, haberin özünü hızlıca açıklayan bir girişle başla ve ardından konuya dair derinlemesine bilgi ver. Makale sonunda konuyla ilgili önemli sonuçlar veya öneriler sun."
+prompt4 = "Yukarıdaki metni, bir gazete makalesi formatında yaz. Yazıyı, haber formatına uygun olarak başlık, alt başlık ve paragraflara ayır. Okuyucuyu bilgilendiren ve dikkatini çeken bir dil kullan, haberin özünü hızlıca açıklayan bir girişle başla ve ardından konuya dair derinlemesine bilgi ver. Makale sonunda konuyla ilgili önemli sonuçlar veya öneriler sun."
+
+
+
+'''
+prompt1 = "Yukarıdaki dokümandaki gereksiz kısımları sil ve düzenli bir üniversite ders notu formatında tekrar yaz."
+prompt2 = "Yukarıdaki metni, bir gazete makalesi formatında yaz. Yazıyı, haber formatına uygun olarak başlık, alt başlık ve paragraflara ayır. Okuyucuyu bilgilendiren ve dikkatini çeken bir dil kullan, haberin özünü hızlıca açıklayan bir girişle başla ve ardından konuya dair derinlemesine bilgi ver. Makale sonunda konuyla ilgili önemli sonuçlar veya öneriler sun."
+prompt3 = "Yukarıdaki dokümanı, bir romanın anlatım tarzında yeniden yazın. Olayları daha akıcı bir şekilde anlatın, duygusal bir ton katın ve karakterlerin bakış açısından anlatmaya çalışın."
+prompt4 = "Yukarıdaki metni, bir blog yazısı formatında, geniş bir okuyucu kitlesine hitap edecek şekilde düzenle. Dilini samimi, akıcı ve anlaşılır tut, aynı zamanda konuyu merak uyandırıcı ve ilgi çekici bir şekilde sun. Paragrafları kısa tutarak okunabilirliği artır, başlıklar ve alt başlıklar ekleyerek yazının yapısını belirginleştir. Örnekler ve anekdotlar ile konuyu daha kişisel ve günlük yaşamla ilişkilendirerek okuyucunun dikkatini çek."
+'''
+# Specify the path to your input CSV file and output files
+
+#file_path = '/content/drive/MyDrive/lora/fine/filtered_doc2line_Filtered_CulturaX_0.csv'
+file_path = './filtered_doc2line_Filtered_CulturaX_0.csv'
+
+output_file_1 = 'finetuned_model_output_prompt1.csv'
+output_file_2 = 'finetuned_model_output_prompt2.csv'
+output_file_3 = 'finetuned_model_output_prompt3.csv'
+output_file_4 = 'finetuned_model_output_prompt4.csv'
+
+# Define a mapping between prompts and their respective output files
+prompt_to_output_file = {
+    prompt1: output_file_1,
+    prompt2: output_file_2,
+    prompt3: output_file_3,
+    prompt4: output_file_4,
+}
+
+# Ensure the model is moved to the correct device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+
+
+
+max_documents = 100
+# max_documents = None
+
+
+csv.field_size_limit(1000000)  # Increase limit to 1MB (adjust as needed)
+
+
+#skip_documents=1 !!!!!!
+
+def read_file_and_process(file_path, max_documents=None, min_document_size=200, skip_documents=40000):
+    try:
+        with open(file_path, 'r') as file:
+            reader = csv.reader(file)
+
+            # Skip header
+            next(reader)
+            print("File opened successfully, starting to read lines...")
+
+            # Dictionary to group rows by `id1` (document identifier)
+            documents = defaultdict(str)  # Store concatenated text for each document
+
+            # Process each row in the CSV
+            for row in reader:
+                document_id = row[0].split('_')[0]  # Extract `id1` (document identifier)
+                input_text = row[1]  # The text column (adjust if necessary)
+
+                # Concatenate the text for rows that have the same `id1`
+                #documents[document_id] += input_text + "|n"  # Add a space between texts
+                documents[document_id] += input_text + "\n"  # Add a space between texts
+
+            print(f"Processed {len(documents)} documents. Grouping by document...")
+
+            # Track the number of valid documents processed
+            valid_documents_processed = 0
+
+            # Create a list of documents in a round-robin fashion (distribute them across different prompts)
+            prompts = [prompt1, prompt2, prompt3, prompt4]
+            document_ids = list(documents.keys())
+
+            # Skip the specified number of documents
+            document_ids = document_ids[skip_documents:]
+            print(f"Skipping the first {skip_documents} documents. Remaining: {len(document_ids)}")
+
+            for i, document_id in enumerate(document_ids):
+                combined_document = documents[document_id]
+
+                # Skip the document if it's too short
+                if len(combined_document) < min_document_size:
+                    print(f"Skipping document {document_id} because it's too short.")
+                    continue  # Skip to the next document
+
+                # Select a prompt in a round-robin fashion
+                selected_prompt = prompts[i % len(prompts)]
+                # Get the corresponding output file for the selected prompt
+                output_file = prompt_to_output_file[selected_prompt]
+
+                # Process the selected document with the assigned prompt
+                new_input_text = str(combined_document) + str(selected_prompt)  # Ensure both parts are strings
+                print(f"New Input text for {document_id}: {new_input_text}")  # Debugging input text
+
+                # Process the text with the model
+                output_text = process_input(new_input_text)
+                print(f"Output from model: {output_text}")  # Debugging output from model
+
+                # Save the result in the respective output file
+                save_to_file(output_file, document_id, combined_document, output_text, selected_prompt)
+
+                # Increment valid document count after processing
+                valid_documents_processed += 1
+
+                # Stop if we have processed enough valid documents
+                if max_documents and valid_documents_processed >= max_documents:
+                    print(f"Processed {valid_documents_processed} valid documents. Stopping.")
+                    break  # Exit the loop once the max number of documents has been processed
+
+            # If the loop ends but max_documents wasn't met, ensure we inform the user
+            if max_documents and valid_documents_processed < max_documents:
+                print(f"Processed {valid_documents_processed} valid documents. Max documents not reached.")
+
+    except Exception as e:
+        print(f"An error occurred while processing the file: {e}")
+
+
+def process_input(new_input_text):
+    try:
+        # Get the model device (CPU or GPU)
+        device = model.device
+
+        '''
+        new_input_text = (
+            "<|start_header_id|>system<|end_header_id|>"
+            "User'ın verdiği görevi yerine getir. Sadece assistant olarak cevap ver. Asla system veya user kullanma.<|eot_id|>"
+            "<|start_header_id|>user<|end_header_id|>"
+            + new_input_text +
+            "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+        )
+        '''
+
+        new_input_text = (
+            "<|start_header_id|>user<|end_header_id|>"
+            + new_input_text +
+            "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+        )
+
+        # Tokenize the input text
+        inputs = tokenizer(
+            new_input_text,
+            return_tensors="pt",
+
+            add_special_tokens=True
+        )
+
+        # Move the input tensors to the same device as the model
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        # Generate output using the model
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+
+                num_return_sequences=1,
+                no_repeat_ngram_size=5,  # Avoid repeated phrases
+
+                max_length=2048,
+
+
+                do_sample=True,
+                temperature=0.6,
+                top_p=0.9,
+
+            )
+
+        # Decode the generated tokens back to text
+        output_text = tokenizer.decode(outputs[0])
+
+        return output_text
+
+    except Exception as e:
+        print(f"Error during model interaction: {e}")
+        return "Error generating response"
+
+
+
+def save_to_file(output_file, document_id, combined_document, output_text, selected_prompt):
+    try:
+        # Open the CSV file in append mode
+        with open(output_file, 'a', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+
+            # Write the document's ID, combined document, the output text, and the selected prompt
+            writer.writerow([document_id, combined_document, output_text])
+
+        print(f"Saved output for document {document_id}.")
+    except Exception as e:
+        print(f"Error saving to file: {e}")
+
+
+
+
+
+# Read the file and process each row
+read_file_and_process(file_path, max_documents)
+
+
+
+
